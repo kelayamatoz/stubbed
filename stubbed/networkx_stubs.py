@@ -4,7 +4,12 @@ import networkx
 import collections
 import itertools
 import typing
+import sys
+import abc
 import atexit
+import random
+
+import weakref
 
 
 class TraceElement(typing.NamedTuple):
@@ -17,109 +22,160 @@ class TraceElement(typing.NamedTuple):
 class MemorySpace(typing.NamedTuple):
     memory_space: int
     size: int
+    element_size: int
 
 
 MemorySpaceCounter = itertools.count()
 
 TraceRegistry: typing.List[typing.Callable[[], TraceElement]] = []
+MemorySpaceRegistry: typing.List[typing.Callable[[], MemorySpace]] = []
 
 
-# Stores Node Attributes, keyed by name.
-class NodeAttrDict(typing.MutableMapping[str, typing.Any]):
-    parent: 'NodeDict'
-    node_id: int
+def dump():
+    for trace in TraceRegistry[:]:
+        print(trace())
 
-    def __init__(self):
-        self._inner = {}
-
-    def __setitem__(self, k: str, v: typing.Any) -> None:
-        self._inner[k] = v
-
-        def materialize():
-            return TraceElement(
-                self.parent.memory_space_id,
-                self.parent.get_loc(self.node_id, k),
-                self.parent.node_attr_size,
-                "WRITE"
-            )
-
-        TraceRegistry.append(materialize)
-
-    def __delitem__(self, k: str) -> None:
-        del self._inner[k]
-
-        def materialize():
-            return TraceElement(
-                self.parent.memory_space_id,
-                self.parent.get_loc(self.node_id, k),
-                self.parent.node_attr_size,
-                "WRITE"
-            )
-
-        TraceRegistry.append(materialize)
-
-    def __getitem__(self, k: str) -> typing.Any:
-        def materialize():
-            return TraceElement(
-                self.parent.memory_space_id,
-                self.parent.get_loc(self.node_id, k),
-                self.parent.node_attr_size,
-                "READ"
-            )
-
-        TraceRegistry.append(materialize)
-        return self._inner[k]
-
-    def __len__(self) -> int:
-        return len(self._inner)
-
-    def __iter__(self):
-        return iter(self._inner)
+    for space in MemorySpaceRegistry[:]:
+        print(space())
 
 
+class TrackedContainer:
+    def __init_subclass__(cls, is_sparse=False):
+        cls.is_sparse = is_sparse
 
-# Stores NodeAttrDicts
-class NodeDict(typing.MutableMapping[typing.Hashable, NodeAttrDict]):
-    _inner: typing.MutableMapping[typing.Hashable, NodeAttrDict]
-    node_attr_size: int = 8
+    parent: 'TrackedContainer'
+    key: typing.Hashable
+    max_len: int
+    max_element_size_registry: typing.List[typing.Union[typing.Callable[[], int]]]
 
-    def __init__(self):
-        self.memory_space_id = next(MemorySpaceCounter)
+    key_to_loc_map: typing.MutableMapping[typing.Hashable, int]
 
-        self._inner = {}
-        attr_counter = itertools.count()
-        self.attr_locations = collections.defaultdict(lambda: next(attr_counter))
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.parent = None
+        self.key = None
+        self._memory_space_id = None
+        self.max_len = len(self)
+        self.max_element_size_registry = []
 
-        node_counter = itertools.count()
-        self.node_locations = collections.defaultdict(lambda: next(node_counter))
+        self._max_size = None
 
-    def __setitem__(self, k: typing.Hashable, v: NodeAttrDict) -> None:
-        self._inner[k] = v
-        v.parent = self
+        self.key_to_loc_map = {}
 
-        # generates a location for the node.
-        self.node_locations[k]
+    def __setitem__(self, key, value):
+        if isinstance(value, TrackedContainer):
+            value.parent = self
+            value.key = key
+            self.max_element_size_registry.append(weakref.ref(value, self.max_size_callback))
+        else:
+            self.max_element_size_registry.append(8)
 
-    def __delitem__(self, v: typing.Hashable) -> None:
-        del self._inner[v]
+        # setting always requires a write
+        TraceRegistry.append(lambda: self.getloc(key)._replace(type="WRITE"))
 
-    def __getitem__(self, k: typing.Hashable) -> NodeAttrDict:
-        return self._inner[k]
+        super().__setitem__(key, value)
 
-    def __len__(self) -> int:
-        return len(self._inner)
+        self.max_len = max(self.max_len, len(self))
+
+    def __getitem__(self, key):
+        val = super().__getitem__(key)
+        if not isinstance(val, TrackedContainer):
+            # Reading into another container can be bypassed via smart address calculation
+            TraceRegistry.append(lambda: self.getloc(key)._replace(type="READ"))
+        return val
+
+    def __delitem__(self, key):
+        TraceRegistry.append(lambda: self.getloc(key)._replace(type="DELETE"))
+        super().__delitem__(self, key)
+
+    def __superiter__(self):
+        return super().__iter__()
 
     def __iter__(self):
-        return iter(self._inner)
+        return super().__iter__()
 
-    def get_loc(self, node_id, attr_name):
+    @property
+    def memory_space_id(self):
+        if self.parent:
+            return self.parent.memory_space_id
+        if self._memory_space_id is None:
+            self._memory_space_id = next(MemorySpaceCounter)
+            MemorySpaceRegistry.append(lambda: MemorySpace(self.memory_space_id, self.getsize(), self.element_size))
+        return self._memory_space_id
 
-        # guarantee that the attribute location is registered
-        self.attr_locations[attr_name]
-        return (node_id * len(self.attr_locations) + self.attr_locations[attr_name]) * self.node_attr_size
+    def getsize(self) -> int:
+        return self.element_size * self.max_len
 
+    @property
+    def element_size(self) -> int:
+        if self._max_size is not None:
+            return self._max_size
+        max_size = 0
+        for element in self.max_element_size_registry:
+            if isinstance(element, int):
+                max_size = max(element, max_size)
+            if isinstance(element, typing.Callable):
+                fetched = element()
+                if fetched:
+                    max_size = max(fetched.getsize(), max_size)
+
+        self._max_size = max_size
+        return self._max_size
+
+    def max_size_callback(self, subcontainer):
+        self.max_element_size_registry.append(subcontainer.getsize())
+
+    def getloc(self, key) -> TraceElement:
+        if self.parent:
+            trace = self.parent.getloc(self.key)
+        else:
+            trace = TraceElement(self.memory_space_id, 0, self.getsize(), "")
+
+        if self.is_sparse:
+            if key not in self.key_to_loc_map:
+                used_offsets = set(self.key_to_loc_map.values())
+                remaining_choices = set(range(self.max_len)) - used_offsets
+                self.key_to_loc_map[key] = random.choice(tuple(remaining_choices))
+            offset = self.key_to_loc_map[key]
+        else:
+            if key >= self.max_len:
+                raise Exception("This should probably have been a sparse array.")
+            offset = key * self.element_size
+
+        return trace._replace(offset=trace.offset + offset, size=self.element_size)
+
+
+class TrackedList(TrackedContainer, list):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        for index, value in enumerate(self.__superiter__()):
+            # register all values.
+            self[index] = value
+
+
+class TrackedDict(TrackedContainer, dict, is_sparse=True):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        for key, value in super().items():
+            # register all values.
+            self[key] = value
+
+    def update(self, *args, **kwargs):
+        for other in args:
+            for k, v in other.items():
+                self[k] = v
+
+        for k, v in kwargs:
+            self[k] = v
+
+    def __contains__(self, item):
+        TraceRegistry.append(lambda: self.getloc(item)._replace(type="READ"))
+        return super().__contains__(item)
 
 
 def stub():
-    networkx.Graph.node_dict_factory = NodeDict
-    networkx.Graph.node_attr_dict_factory = NodeAttrDict
+    networkx.Graph.node_dict_factory = TrackedDict
+    networkx.Graph.node_attr_dict_factory = TrackedDict
+    networkx.Graph.adjlist_inner_dict_factory = TrackedDict
+    networkx.Graph.adjlist_outer_dict_factory = TrackedDict
+    networkx.Graph.edge_attr_dict_factory = TrackedDict
