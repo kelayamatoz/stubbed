@@ -1,10 +1,10 @@
+from typing import Iterator
+
 import networkx
 import collections
 import itertools
 import typing
 import atexit
-
-from stubbed.core import FunctionWrapper
 
 
 class TraceElement(typing.NamedTuple):
@@ -14,144 +14,112 @@ class TraceElement(typing.NamedTuple):
     type: str
 
 
-class GraphWrapper(FunctionWrapper):
-    graph_element_sizes = collections.defaultdict(int)
-    graph_node_id_size = 32  # Bytes
-    graph_node_hashtable_size = 128
-    graph_edge_hashtable_size = 128
-    trace = []
+class MemorySpace(typing.NamedTuple):
+    memory_space: int
+    size: int
 
 
-    loc_counter = itertools.count(step=4)
-    graph_id_to_loc_map = {}
-    NODE_OFFSET = 0
-    EDGE_OFFSET = 1
-    NODE_HASHSET = 2
-    EDGE_HASHSET = 3
+MemorySpaceCounter = itertools.count()
 
-    @staticmethod
-    def get_location(graph):
-        if id(graph) not in GraphWrapper.graph_id_to_loc_map:
-            GraphWrapper.graph_id_to_loc_map[id(graph)] = next(GraphWrapper.loc_counter)
-        return GraphWrapper.graph_id_to_loc_map[id(graph)]
+TraceRegistry: typing.List[typing.Callable[[], TraceElement]] = []
 
 
-    @staticmethod
-    def get_graph_node_attr_size(graph: networkx.Graph):
-        attr_dicts = (j for i, j in graph.nodes.data(True))
-        unique_attr_names = set(itertools.chain.from_iterable(attr_dicts))
-        return len(unique_attr_names) * 8
+# Stores Node Attributes, keyed by name.
+class NodeAttrDict(typing.MutableMapping[str, typing.Any]):
+    parent: 'NodeDict'
+    node_id: int
 
-    @staticmethod
-    def get_graph_edge_attr_size(graph: networkx.Graph):
-        print(graph.edges.data(True))
-        attr_dicts = (d for i, j, d in graph.edges.data(True))
-        unique_attr_names = set(itertools.chain.from_iterable(attr_dicts))
-        return len(unique_attr_names) * 8
+    def __init__(self):
+        self._inner = {}
 
-    @staticmethod
-    def dump():
-        # freeze trace so that further actions don't affect the trace
-        traces = GraphWrapper.trace[:]
-        materialized = [trace() for trace in traces]
-        GraphWrapper.trace = traces
-        print([i for i in materialized if i.size])
-
-
-class GraphAddNode(GraphWrapper):
-    def before(self, graph: networkx.Graph, node, **attrs):
-        index = graph.number_of_nodes()
-        def materialize():
-            return TraceElement(GraphWrapper.get_location(graph) + GraphWrapper.NODE_OFFSET, index, GraphWrapper.get_graph_node_attr_size(graph), "WRITE")
-        self.trace.append(materialize)
-
-
-GraphAddNode.method_hook(networkx.Graph, "add_node")
-
-
-class GraphAddNodesFrom(GraphWrapper):
-    def before(self, graph: networkx.Graph, nodes, **attrs):
-        index = graph.number_of_nodes()
-        # push current count.
-        self.current_count = index
-
-    def after(self, val, graph, *args, **kwargs):
-        current_count = self.current_count
-        new_count = graph.number_of_nodes()
-        def materialize():
-            return TraceElement(GraphWrapper.get_location(graph) + GraphWrapper.NODE_OFFSET, self.current_count,
-                                GraphWrapper.get_graph_node_attr_size(graph) * (new_count - current_count), "WRITE")
-
-        self.trace.append(materialize)
-
-
-GraphAddNodesFrom.method_hook(networkx.Graph, "add_nodes_from")
-
-
-class GraphAddEdge(GraphWrapper):
-    def before(self, graph: networkx.Graph, edge, **attrs):
-        index = graph.number_of_nodes()
-        def materialize():
-            return TraceElement(GraphWrapper.get_location(graph) + GraphWrapper.EDGE_OFFSET, index, GraphWrapper.get_graph_edge_attr_size(graph), "WRITE")
-
-        self.trace.append(materialize)
-
-        self.current_node_count = graph.number_of_nodes()
-
-    def after(self, val, graph: networkx.Graph, edge, **attrs):
-        current_count = self.current_node_count
-        new_count = graph.number_of_nodes()
-        if current_count == new_count:
-            return
-        
-        def materialize():
-            return TraceElement(GraphWrapper.get_location(graph) + GraphWrapper.NODE_OFFSET, current_count, GraphWrapper.get_graph_node_attr_size(graph), "WRITE")
-
-        self.trace.append(materialize)
-
-
-GraphAddEdge.method_hook(networkx.Graph, "add_edge")
-
-
-class GraphAddEdgesFrom(GraphWrapper):
-    def before(self, graph: networkx.Graph, nodes, **attrs):
-        index = graph.number_of_edges()
-        # push current count.
-        self.current_count = index
-
-        # since add_edges_from can also be adding nodes, we should also count those
-        self.node_count = graph.number_of_nodes()
-
-    def after(self, val, graph, *args, **kwargs):
-        current_count = self.current_count
-        new_count = graph.number_of_edges()
-
-        current_node_count = self.node_count
-        new_node_count = graph.number_of_nodes()
+    def __setitem__(self, k: str, v: typing.Any) -> None:
+        self._inner[k] = v
 
         def materialize():
-            return TraceElement(GraphWrapper.get_location(graph) + GraphWrapper.EDGE_OFFSET, current_count,
-                                GraphWrapper.get_graph_edge_attr_size(graph) * (new_count - current_count), "WRITE")
-        self.trace.append(materialize)
+            return TraceElement(
+                self.parent.memory_space_id,
+                self.parent.get_loc(self.node_id, k),
+                self.parent.node_attr_size,
+                "WRITE"
+            )
 
-        def materialize_nodes():
-            return TraceElement(GraphWrapper.get_location(graph) + GraphWrapper.NODE_OFFSET, current_node_count,
-                                GraphWrapper.get_graph_node_attr_size(graph) * (new_node_count - current_node_count), "WRITE")
-        self.trace.append(materialize_nodes)
+        TraceRegistry.append(materialize)
 
+    def __delitem__(self, k: str) -> None:
+        del self._inner[k]
 
-GraphAddEdgesFrom.method_hook(networkx.Graph, "add_edges_from")
-
-
-class GraphContainsNode(GraphWrapper):
-    def before(self, graph, n, *args, **kwargs):
         def materialize():
-            return TraceElement(GraphWrapper.get_location(graph) + GraphWrapper.NODE_HASHSET, hash(n) % GraphWrapper.graph_node_hashtable_size,
-                                GraphWrapper.graph_node_id_size, "READ")
-        self.trace.append(materialize)
+            return TraceElement(
+                self.parent.memory_space_id,
+                self.parent.get_loc(self.node_id, k),
+                self.parent.node_attr_size,
+                "WRITE"
+            )
+
+        TraceRegistry.append(materialize)
+
+    def __getitem__(self, k: str) -> typing.Any:
+        def materialize():
+            return TraceElement(
+                self.parent.memory_space_id,
+                self.parent.get_loc(self.node_id, k),
+                self.parent.node_attr_size,
+                "READ"
+            )
+
+        TraceRegistry.append(materialize)
+        return self._inner[k]
+
+    def __len__(self) -> int:
+        return len(self._inner)
+
+    def __iter__(self):
+        return iter(self._inner)
 
 
-GraphContainsNode.method_hook(networkx.Graph, "__contains__")
-GraphContainsNode.method_hook(networkx.Graph, "has_node")
 
-atexit.register(GraphWrapper.dump)
+# Stores NodeAttrDicts
+class NodeDict(typing.MutableMapping[typing.Hashable, NodeAttrDict]):
+    _inner: typing.MutableMapping[typing.Hashable, NodeAttrDict]
+    node_attr_size: int = 8
+
+    def __init__(self):
+        self.memory_space_id = next(MemorySpaceCounter)
+
+        self._inner = {}
+        attr_counter = itertools.count()
+        self.attr_locations = collections.defaultdict(lambda: next(attr_counter))
+
+        node_counter = itertools.count()
+        self.node_locations = collections.defaultdict(lambda: next(node_counter))
+
+    def __setitem__(self, k: typing.Hashable, v: NodeAttrDict) -> None:
+        self._inner[k] = v
+        v.parent = self
+
+        # generates a location for the node.
+        self.node_locations[k]
+
+    def __delitem__(self, v: typing.Hashable) -> None:
+        del self._inner[v]
+
+    def __getitem__(self, k: typing.Hashable) -> NodeAttrDict:
+        return self._inner[k]
+
+    def __len__(self) -> int:
+        return len(self._inner)
+
+    def __iter__(self):
+        return iter(self._inner)
+
+    def get_loc(self, node_id, attr_name):
+
+        # guarantee that the attribute location is registered
+        self.attr_locations[attr_name]
+        return (node_id * len(self.attr_locations) + self.attr_locations[attr_name]) * self.node_attr_size
+
+
+
+def stub():
+    networkx.Graph.node_dict_factory = NodeDict
+    networkx.Graph.node_attr_dict_factory = NodeAttrDict

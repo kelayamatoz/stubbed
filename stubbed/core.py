@@ -23,6 +23,7 @@ class FunctionWrapper:
         def func(self, *args, **kwargs):
             return wrapped(self, *args, **kwargs)
         setattr(target, name, func)
+        return wrapped
 
     @classmethod
     def function_hook(cls, func):
