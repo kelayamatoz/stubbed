@@ -30,14 +30,17 @@ TraceRegistry: typing.List[typing.Callable[[], TraceElement]] = []
 MemorySpaceRegistry: typing.List[typing.Callable[[], MemorySpace]] = []
 
 
-def dump(tracefile=sys.stdout, spacefile=sys.stdout):
+def dumptrace(tracefile=sys.stdout):
     print("Traces:", len(TraceRegistry))
     for trace in TraceRegistry[:]:
         print(*trace(), file=tracefile, sep="\t")
 
+
+def dumpmem(spacefile=sys.stdout):
     print("Spaces:", len(MemorySpaceRegistry))
     for space in MemorySpaceRegistry[:]:
         print(*space(), file=spacefile, sep="\t")
+
 
 def reset():
     TraceRegistry.clear()
