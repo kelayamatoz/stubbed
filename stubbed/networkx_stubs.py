@@ -33,7 +33,11 @@ MemorySpaceRegistry: typing.List[typing.Callable[[], MemorySpace]] = []
 def dumptrace(tracefile=sys.stdout):
     print("Traces:", len(TraceRegistry))
     for trace in TraceRegistry[:]:
-        print(*trace(), file=tracefile, sep="\t")
+        try:
+            print(*trace(), file=tracefile, sep="\t")
+        except TypeError:
+            # Networkx has a bad habit of catching TypeErrors
+            pass
 
 
 def dumpmem(spacefile=sys.stdout):
