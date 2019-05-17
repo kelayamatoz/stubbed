@@ -69,7 +69,10 @@ class TrackedContainer:
     max_element_size_registry: typing.List[typing.Union[typing.Callable[[], int]]]
 
     # Overhead
-    base_size: int = 8
+    base_size: int = 4
+
+    # feature size
+    feature_size: int = 4
 
     key_to_loc_map: typing.MutableMapping[typing.Hashable, int]
 
@@ -91,7 +94,7 @@ class TrackedContainer:
             value.key = key
             self.max_element_size_registry.append(weakref.ref(value, self.max_size_callback))
         else:
-            self.max_element_size_registry.append(8)
+            self.max_element_size_registry.append(self.feature_size)
 
         # setting always requires a write
         TraceRegistry.append(lambda: self.getloc(key)._replace(type=TraceElement.WRITE))
