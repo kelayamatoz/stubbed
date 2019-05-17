@@ -39,6 +39,9 @@ def dump(tracefile=sys.stdout, spacefile=sys.stdout):
     for space in MemorySpaceRegistry[:]:
         print(*space(), file=spacefile, sep="\t")
 
+def reset():
+    TraceRegistry.clear()
+
 
 class TrackedIterator(typing.Iterator):
     def __init__(self, inner_iter, container: 'TrackedContainer', trace_size=1):
