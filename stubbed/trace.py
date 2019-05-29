@@ -6,7 +6,7 @@ import sys
 import typing
 import dataclasses
 
-from stubbed.lazy_value import Evaluable
+import stubbed.lazy_value as slv
 
 
 class MemoryAccessType(enum.Enum):
@@ -17,9 +17,7 @@ class MemoryAccessType(enum.Enum):
 
 
 class TraceElement(typing.NamedTuple):
-    memory: 'Memory'
-    offset: Evaluable[int]
-    size: Evaluable[int]
+    memory: 'MemoryBlock'
     type: MemoryAccessType = MemoryAccessType.UNKNOWN
     iterator_id: int = -1
 
@@ -38,11 +36,21 @@ class MemorySpace:
 
 
 @dataclasses.dataclass
-class Memory:
-    space: MemorySpace = dataclasses.field(default_factory=MemorySpace)
-    id: int = -1
-    size: int = Evaluable[int]
-    element_size: int = Evaluable[int]
+class MemoryBlock:
+    space: slv.Evaluable[MemorySpace]
+    offset: slv.Evaluable[int]  # In bytes
+    element_size: slv.Evaluable[int]
+    num_elements: slv.Evaluable[int]
+
+    def adjust_offset(self, shift: slv.Evaluable[int]):
+        """
+        :param shift: Shift amount in terms of bytes
+        :return: shifted block (offset + shift)
+        """
+        new_offset = slv.Operation(lambda x: x[0] + x[1], [self.offset, shift])
+        return MemoryBlock(
+            self.space, new_offset, self.element_size, self.num_elements
+        )
 
 
 class TraceContext(contextlib.AbstractContextManager):
@@ -50,7 +58,7 @@ class TraceContext(contextlib.AbstractContextManager):
     context_counter: typing.ClassVar[itertools.count] = itertools.count()
     enabled: bool = True
 
-    event_list: typing.List[typing.Callable[[], TraceElement]]
+    event_list: typing.List[slv.Evaluable[TraceElement]]
 
     def __init__(self, name: str = "unnamed"):
         self.id = next(self.context_counter)
@@ -77,10 +85,10 @@ class TraceContext(contextlib.AbstractContextManager):
         is_enabled = self.enabled
         self.enabled = False
         for event in self.event_list:
-            print(*event(), file=output)
+            print(*event.evaluate(), file=output)
         self.enabled = is_enabled
 
-    def register_event(self, event: typing.Callable[[], TraceElement]) -> bool:
+    def register_event(self, event: slv.Evaluable[TraceElement]) -> bool:
         if self.enabled:
             self.event_list.append(event)
         return self.enabled
