@@ -186,6 +186,9 @@ class TrackedList(TrackedContainer, list):
             # register all values.
             self[index] = value
 
+    def __iter__(self):
+        return TrackedIterator(list.__iter__(self), self)
+
 
 class TrackedDict(TrackedContainer, dict, is_sparse=True):
     def __init__(self, *args, **kwargs):
