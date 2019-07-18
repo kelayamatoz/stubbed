@@ -19,8 +19,8 @@ TraceElement.WRITE = "W"
 
 class MemorySpace(typing.NamedTuple):
     memory_space: int
-    size: int
-    element_size: int
+    size: int # in number of bytes
+    element_size: int # in number of bytes
 
 
 MemorySpaceCounter = itertools.count()
@@ -86,15 +86,16 @@ class TrackedContainer:
 
     key_to_loc_map: typing.MutableMapping[typing.Hashable, int]
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, is_host_init=False, max_size=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.parent = None
         self.key = None
         self._memory_space_id = None
+        self._is_host_init = is_host_init
         self.max_len = len(self)
         self.max_element_size_registry = []
 
-        self._max_size = None
+        self._max_size = max_size
 
         self.key_to_loc_map = {}
 
@@ -106,8 +107,12 @@ class TrackedContainer:
         else:
             self.max_element_size_registry.append(self.feature_size)
 
-        # setting always requires a write
-        TraceRegistry.append(lambda: self.getloc(key)._replace(type=TraceElement.WRITE))
+        # If is not a host init, we should assume that the data is prepared
+        # in the DRAM and the accelerator can just read from it.
+        if not self._is_host_init:
+            TraceRegistry.append(
+                lambda: self.getloc(key)._replace(type=TraceElement.WRITE)
+            )
 
         super().__setitem__(key, value)
 
@@ -115,7 +120,19 @@ class TrackedContainer:
 
     def __getitem__(self, key):
         val = super().__getitem__(key)
-        if not isinstance(val, TrackedContainer):
+
+        if isinstance(key, slice):
+            # Issue a dense read for slices
+            start = key.start if key.start else 0
+            stop = key.stop if key.stop else len(self)
+            length = stop - start
+            TraceRegistry.append(
+                lambda: self.getloc(start)._replace(
+                    type=TraceElement.READ,
+                    size=self.feature_size * length
+                )
+            )
+        elif not isinstance(val, TrackedContainer):
             # Reading into another container can be bypassed via smart address calculation
             TraceRegistry.append(lambda: self.getloc(key)._replace(type=TraceElement.READ))
         return val
@@ -133,7 +150,9 @@ class TrackedContainer:
             return self.parent.memory_space_id
         if self._memory_space_id is None:
             self._memory_space_id = next(MemorySpaceCounter)
-            MemorySpaceRegistry.append(lambda: MemorySpace(self.memory_space_id, self.getsize(), self.element_size))
+            MemorySpaceRegistry.append(
+                lambda: MemorySpace(self.memory_space_id, self.getsize(), self.element_size)
+            )
         return self._memory_space_id
 
     def getsize(self) -> int:
@@ -180,14 +199,25 @@ class TrackedContainer:
 
 
 class TrackedList(TrackedContainer, list):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, *args, is_host_init=False, **kwargs):
+        super().__init__(*args, is_host_init=is_host_init, **kwargs)
         for index, value in enumerate(list.__iter__(self)):
             # register all values.
-            self[index] = value
+                self[index] = value
+        self._head = self[0]
 
     def __iter__(self):
         return TrackedIterator(list.__iter__(self), self)
+
+    def __setitem__(self, key, value):
+        if isinstance(key, slice):
+            raise NotImplementedError
+        else:
+            return super(TrackedList, self).__setitem__(key, value)
+
+    @property
+    def head(self):
+        return self._head
 
 
 class TrackedDict(TrackedContainer, dict, is_sparse=True):
