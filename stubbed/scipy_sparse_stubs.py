@@ -1,28 +1,36 @@
 from .networkx_stubs import TrackedList as TList
+from .networkx_stubs import TraceListElement
 from scipy.sparse import _sparsetools
+import functools
+from functools import partial
 
 
 _n_bytes = 4
 
 
 def csr_matmat_pass1(fn, *args, **kwargs):
-    # We are assuming that this pass would keep all the necessary data in
-    # and can fuse with csr_matmat_pass2...
-    # We are also assuming that the W is pipelined with R.
+    """
+    We are assuming that this pass would keep all the necessary data in
+    and can fuse with csr_matmat_pass2...
+    We are also assuming that the W is pipelined with R.
 
-    # Pseudo code
-    # for i in range(n_row):
-    #     row_nnz = 0
-    #     for jj in range(Ap[i], Ap[i+1]):
-    #         j = Aj[jj]
-    #         for kk in range(Bp[j], Bp[j+1]):
-    #             k = Bj[kk]
-    #             if not mask[k] == i:
-    #                 mask[k] = i
-    #                 row_nnz += 1
-    #
-    #     nnz = nnz + row_nnz
-    #     Cp[i+1] = nnz
+    Pseudo code
+    for i in range(n_row):
+        row_nnz = 0
+        for jj in range(Ap[i], Ap[i+1]):
+            j = Aj[jj]
+            for kk in range(Bp[j], Bp[j+1]):
+                k = Bj[kk]
+                if not mask[k] == i:
+                    mask[k] = i
+                    row_nnz += 1
+
+        nnz = nnz + row_nnz
+        Cp[i+1] = nnz
+    """
+
+    from .networkx_stubs import TraceDepsRegistry as tdr
+    from .networkx_stubs import TraceRegistry as tr
 
     n_row, n_col, *tail = args
     Ap, Aj, Bp, Bj, Cp = [TList(x, is_host_init=True) for x in tail]
@@ -46,9 +54,8 @@ def csr_matmat_pass1(fn, *args, **kwargs):
 
         Ap_last_ptr = Ap_curr_ptr
 
-        # Emulate a write
+        # Emulates a write
         Cp[i+1] = 0
-
 
     return fn(*args, **kwargs)
 
@@ -119,6 +126,7 @@ def csr_matvec(fn, *args, **kwargs):
 
 
 def csr_matvecs(fn, *args, **kwargs):
+    print("in csr_matvecs")
     n_row, _, n_vecs, *tail = args
     Ap, Aj, Ax, Xx, Yx = [
         TList(x, is_host_init=True) for x in tail

@@ -1,6 +1,5 @@
 import numpy
 from numpy import array_equal
-import stubbed.stubbed.networkx_stubs as nxstbs
 from .networkx_stubs import TrackedList as TList
 
 
