@@ -168,7 +168,7 @@ def csr_matvecs(fn, *args, **kwargs):
     :param kwargs:
     :return:
     """
-    print("in csr matvecs")
+    print("in csr_matvecs")
     n_row, _, n_vecs, *tail = args
     Ap, Aj, Ax, Xx, Yx = [
         TList(x, is_host_init=True) for x in tail
