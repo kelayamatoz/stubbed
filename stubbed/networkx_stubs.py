@@ -6,14 +6,6 @@ import sys
 import weakref
 
 
-INVALID_ID: int = -1
-
-
-class TraceListElement(typing.NamedTuple):
-    list_element: object
-    trace_id: int = 0
-
-
 class TraceElement(typing.NamedTuple):
     memory_space: int
     offset: int
@@ -22,23 +14,9 @@ class TraceElement(typing.NamedTuple):
     iterator_id: int = -1
 
 
-class TraceElementDeps(typing.NamedTuple):
-    """
-    New Format (per Alex's request):
-    [Deps on], Number, addr, size, [out edges]
-    where:
-        Deps on are accesses that the access depends on
-        Out edges are accesses that depend on this access
-        Number is a unique number per access
-    """
-    deps_on: typing.List[int] = []
-    out_edges: typing.List[int] = []
-
-
-class TraceElementRange(range):
-
-    def __init__(self) -> None:
-        super().__init__()
+class TraceDepElement(typing.NamedTuple):
+    dep_on: typing.List[int]
+    edges_out: typing.List[int]
 
 
 TraceElement.READ = "R"
@@ -47,46 +25,48 @@ TraceElement.WRITE = "W"
 
 class MemorySpace(typing.NamedTuple):
     memory_space: int
-    size: int # in number of bytes
-    element_size: int # in number of bytes
+    size: int  # in number of bytes
+    element_size: int  # in number of bytes
 
 
-MemorySpaceCounter = itertools.count()
-IteratorCounter = itertools.count()
-TraceCounter = itertools.count()
-
-TraceDepsRegistry: typing.List[TraceElementDeps] = []
+TraceDepRegistry: typing.List[TraceDepElement] = []
 
 
 class RegistryList(list):
 
-    def append(self, item, deps_ons: typing.List = []) -> None:
-        """
-        Besides regular update, this function also updates the out_edges
-        of previous accesses that this access depends on.
-        :param item:
-        :param deps_ons:
-        :return:
-        """
-        curr_id = len(TraceDepsRegistry)
-        TraceDepsRegistry.append(TraceElementDeps(
-            deps_on=deps_ons
-        ))
-        super().append(item)
+    def append(
+            self, object: typing.Callable[[], TraceElement],
+            deps: typing.List[int] = None,
+            out_edges: typing.List[int] = None
+    ) -> typing.Optional[int]:
+        curr_id = len(TraceRegistry)
+        deps = deps if deps else []
+        out_edges = out_edges if out_edges else []
+        TraceDepRegistry.append(TraceDepElement(deps, out_edges))
+        for dep_id in deps:
+            TraceDepRegistry[dep_id].edges_out.append(curr_id)
+        super().append(object)
 
-        for trace_id in deps_ons:
-            TraceDepsRegistry[trace_id].out_edges.append(curr_id)
+        return curr_id
 
 
+MemorySpaceCounter = itertools.count()
+IteratorCounter = itertools.count()
+
+# TraceRegistry: typing.List[typing.Callable[[], TraceElement]] = []
 TraceRegistry = RegistryList()
 MemorySpaceRegistry: typing.List[typing.Callable[[], MemorySpace]] = []
 
 
 def dumptrace(tracefile=sys.stdout):
     print("Traces:", len(TraceRegistry))
-    for trace in TraceRegistry[:]:
+    for trace_id, (trace, trace_dep) in enumerate(
+            zip(TraceRegistry[:], TraceDepRegistry[:])):
         try:
-            print(*trace(), file=tracefile, sep="\t")
+            print(trace_id, file=tracefile, sep="\t", end="\t")
+            print(*trace(), file=tracefile, sep="\t", end="\t")
+            print(*trace_dep, file=tracefile, sep="\t")
+
         except TypeError:
             # Networkx has a bad habit of catching TypeErrors
             pass
@@ -103,9 +83,8 @@ def reset():
 
 
 class TrackedIterator(typing.Iterator):
-    def __init__(
-        self, inner_iter, container: 'TrackedContainer', trace_size=1
-    ):
+    def __init__(self, inner_iter, container: 'TrackedContainer',
+                 trace_size=1):
         self.container = container
         self.inner_iter = enumerate(inner_iter)
         self.trace_size = trace_size
@@ -116,10 +95,8 @@ class TrackedIterator(typing.Iterator):
         if count % self.trace_size == 0:
             TraceRegistry.append(lambda: self.container.getbase()._replace(
                 offset=count * self.container.element_size,
-                size=max(
-                    self.trace_size * self.container.element_size,
-                    self.container.getsize()
-                ),
+                size=max(self.trace_size * self.container.element_size,
+                         self.container.getsize()),
                 type=TraceElement.READ,
                 iterator_id=self.iterator_id
             ))
@@ -134,8 +111,7 @@ class TrackedContainer:
     key: typing.Hashable
     max_len: int
     max_element_size_registry: typing.List[
-        typing.Union[typing.Callable[[], int]]
-    ]
+        typing.Union[typing.Callable[[], int]]]
 
     # Overhead
     base_size: int = 4
@@ -146,13 +122,6 @@ class TrackedContainer:
     key_to_loc_map: typing.MutableMapping[typing.Hashable, int]
 
     def __init__(self, *args, is_host_init=False, max_size=None, **kwargs):
-        """
-
-        :param args:
-        :param is_host_init: shows if this allocation is an init allocation.
-        :param max_size:
-        :param kwargs:
-        """
         super().__init__(*args, **kwargs)
         self.parent = None
         self.key = None
@@ -160,7 +129,9 @@ class TrackedContainer:
         self._is_host_init = is_host_init
         self.max_len = len(self)
         self.max_element_size_registry = []
+
         self._max_size = max_size
+
         self.key_to_loc_map = {}
 
     def __setitem__(self, key, value):
@@ -168,12 +139,9 @@ class TrackedContainer:
             value.parent = self
             value.key = key
             self.max_element_size_registry.append(
-                weakref.ref(value, self.max_size_callback)
-            )
+                weakref.ref(value, self.max_size_callback))
         else:
-            self.max_element_size_registry.append(
-                self.feature_size
-            )
+            self.max_element_size_registry.append(self.feature_size)
 
         # If is not a host init, we should assume that the data is prepared
         # in the DRAM and the accelerator can just read from it.
@@ -186,71 +154,38 @@ class TrackedContainer:
 
         self.max_len = max(self.max_len, len(self))
 
-    def __getitem__(self, key):
+    def __getitem__(
+            self, key, deps: typing.List[int] = [],
+            out_edges: typing.List[int] = []
+    ):
         val = super().__getitem__(key)
 
         if isinstance(key, slice):
-            def get_slice_dep(_x: slice):
-                """
-                Check for types of start and stop.
-                If is native type of python, we can just go ahead and issue
-                the dense loads without dependencies.
-                Otherwise, if is TraceListElement type, it means that the
-                range indices were from previous reads and this read
-                depends on the previous indices. In this case, we need
-                to update both the registered trace element and the current one
-                with dependency information.
-                :param _x: a slice that may contain either python builtins
-                or trace list element (i.e. start and stop indices
-                depend on previous reads)
-                :return:
-                """
-                def extract_field(
-                        slice_field, default_val: int = 0
-                ) -> (int, int, int, int) :
-                    if isinstance(slice_field, TraceListElement):
-                        raw_field = slice_field.list_element
-                        field = raw_field if raw_field else default_val
-                        dep_id = slice_field.trace_id
-                    else:
-                        field = slice_field if slice_field else default_val
-                        dep_id = INVALID_ID
-
-                    return field, dep_id
-
-                st, st_dep_id = extract_field(_x, 0)
-                ed, ed_dep_id = extract_field(_x, len(self))
-                dep_ids = list(
-                    filter(
-                        lambda x: x != INVALID_ID, [st_dep_id, ed_dep_id])
-                )
-
-                return st, ed, dep_ids
-
-            start, stop, dep_ids = get_slice_dep(key)
+            # Issue a dense read for slices
+            start = key.start if key.start else 0
+            stop = key.stop if key.stop else len(self)
             length = stop - start
-
-            TraceRegistry.append(
+            trace_id = TraceRegistry.append(
                 lambda: self.getloc(start)._replace(
                     type=TraceElement.READ,
                     size=self.feature_size * length
                 ),
-                deps_ons=dep_ids
+                deps=deps,
+                out_edges=out_edges
             )
-
         elif not isinstance(val, TrackedContainer):
-            # Reading into another container can be
-            # bypassed via smart address calculation
-            TraceRegistry.append(
-                lambda: self.getloc(key)._replace(type=TraceElement.READ)
+            # Reading into another container can be bypassed via smart address calculation
+            trace_id = TraceRegistry.append(
+                lambda: self.getloc(key)._replace(
+                    type=TraceElement.READ
+                ),
+                deps=deps,
+                out_edges=out_edges
             )
-
-        return val
+        return val, trace_id
 
     def __delitem__(self, key):
-        TraceRegistry.append(
-            lambda: self.getloc(key)._replace(type="DELETE")
-        )
+        TraceRegistry.append(lambda: self.getloc(key)._replace(type="DELETE"))
         super().__delitem__(self, key)
 
     def __iter__(self):
@@ -263,9 +198,8 @@ class TrackedContainer:
         if self._memory_space_id is None:
             self._memory_space_id = next(MemorySpaceCounter)
             MemorySpaceRegistry.append(
-                lambda: MemorySpace(
-                    self.memory_space_id, self.getsize(), self.element_size
-                )
+                lambda: MemorySpace(self.memory_space_id, self.getsize(),
+                                    self.element_size)
             )
         return self._memory_space_id
 
@@ -302,19 +236,17 @@ class TrackedContainer:
             if key not in self.key_to_loc_map:
                 used_offsets = set(self.key_to_loc_map.values())
                 remaining_choices = set(range(self.max_len)) - used_offsets
-                self.key_to_loc_map[key] = \
-                    random.choice(tuple(remaining_choices))
+                self.key_to_loc_map[key] = random.choice(
+                    tuple(remaining_choices))
             offset = self.key_to_loc_map[key]
         else:
             if key >= self.max_len:
                 raise Exception(
-                    "This should probably have been a sparse array."
-                )
+                    "This should probably have been a sparse array.")
             offset = key * self.element_size
 
-        return trace._replace(
-            offset=trace.offset + offset, size=self.element_size
-        )
+        return trace._replace(offset=trace.offset + offset,
+                              size=self.element_size)
 
 
 class TrackedList(TrackedContainer, list):
@@ -322,22 +254,14 @@ class TrackedList(TrackedContainer, list):
         super().__init__(*args, is_host_init=is_host_init, **kwargs)
         for index, value in enumerate(list.__iter__(self)):
             # register all values.
-                self[index] = value
+            self[index] = value
         self._head = self[0]
 
     def __iter__(self):
         return TrackedIterator(list.__iter__(self), self)
 
-    def __getitem__(self, item):
-        return TraceListElement(
-            list_element=super(TrackedList, self).__getitem__(item),
-            trace_id=len(TraceDepsRegistry) - 1
-        )
-
     def __setitem__(self, key, value):
         if isinstance(key, slice):
-            # For now, we only support burst reads.
-            # Burst reads are more common for the sparse apps.
             raise NotImplementedError
         else:
             return super(TrackedList, self).__setitem__(key, value)
@@ -373,8 +297,7 @@ class TrackedDict(TrackedContainer, dict, is_sparse=True):
 
     def __contains__(self, item):
         TraceRegistry.append(
-            lambda: self.getloc(item)._replace(type=TraceElement.READ)
-        )
+            lambda: self.getloc(item)._replace(type=TraceElement.READ))
         return super().__contains__(item)
 
 
