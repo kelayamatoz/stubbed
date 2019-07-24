@@ -2,6 +2,7 @@ from .networkx_stubs import TrackedList as TList
 from scipy.sparse import _sparsetools
 from functools import partial
 
+from torch import sparse
 # For debugging
 from .networkx_stubs import TraceRegistry as tr
 from .networkx_stubs import TraceDepRegistry as tdr
