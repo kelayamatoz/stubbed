@@ -1,21 +1,25 @@
 import numpy as np
 import typing
 from .networkx_stubs import TrackedList as TList
+from .networkx_stubs import get_last_trace_id
 from .networkx_stubs import TraceDepRegistry as tdr
 from .networkx_stubs import TraceRegistry as tr
 
 
 class NpSet(set):
     """
-    Numpy ndarray is not hashable. However a tuple type is.
+    Numpy ndarray is not hashable. However a tuple of a flattened numpy
+    array is.
     This function wraps a numpy ndarray with a tuple wrapper.
     """
 
     def add(self, element: np.ndarray) -> None:
-        super().add(tuple(element))
+        super().add(tuple(element.flatten()))
 
-    def __contains__(self, item: np.ndarray):
-        return super(NpSet, self).__contains__(tuple(item))
+    def __contains__(self, item):
+        if isinstance(item, TArray):
+            item = item.view(np.ndarray)
+        return super(NpSet, self).__contains__(tuple(item.flatten()))
 
 
 ProfiledArraySet: typing.Set = NpSet()
@@ -46,7 +50,10 @@ class TArray(np.ndarray):
                     tmp = TList(
                         [0] * k.size, is_host_init=True
                     )
-                    _ = tmp[:]
+                    _ = tmp.__getitem__(
+                        slice(None, None, None),
+                        deps=[get_last_trace_id()]
+                    )
 
             _profiled_check([self.T, other.T])
 
@@ -60,16 +67,22 @@ class TArray(np.ndarray):
                         tmp = TList(
                             [0] * k.size, is_host_init=True
                         )
-                        _ = tmp[:]
+                        _ = tmp.__getitem__(
+                            slice(None, None, None),
+                            deps=[get_last_trace_id()]
+                        )
 
                 _profiled_check([self.T, other.T])
         else:
            # a postfix function without args.
             if self in ProfiledArraySet:
                 tmp = TList(
-                    [0] * k.size, is_host_init=True
+                    [0] * self.size, is_host_init=True
                 )
-                _ = tmp[:]
+                _ = tmp.__getitem__(
+                    slice(None, None, None),
+                    deps=[get_last_trace_id()]
+                )
 
                 _profiled_check([self.T])
 

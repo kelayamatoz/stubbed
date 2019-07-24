@@ -40,11 +40,12 @@ class RegistryList(list):
             out_edges: typing.List[int] = None
     ) -> typing.Optional[int]:
         curr_id = len(TraceRegistry)
-        deps = deps if deps else []
+        deps = deps if list(filter(lambda x: x >= 0, deps)) else []
         out_edges = out_edges if out_edges else []
         TraceDepRegistry.append(TraceDepElement(deps, out_edges))
         for dep_id in deps:
-            TraceDepRegistry[dep_id].edges_out.append(curr_id)
+            if dep_id >= 0: # Guard against the first access
+                TraceDepRegistry[dep_id].edges_out.append(curr_id)
         super().append(object)
 
         return curr_id
@@ -56,6 +57,18 @@ IteratorCounter = itertools.count()
 # TraceRegistry: typing.List[typing.Callable[[], TraceElement]] = []
 TraceRegistry = RegistryList()
 MemorySpaceRegistry: typing.List[typing.Callable[[], MemorySpace]] = []
+
+
+def get_last_trace_id():
+    """
+    This function is used for getting the last trace id.
+    Generally speaking, we need to obtain the dependencies between traces.
+    If the program exits a stubbed function, the next function,
+    when starting off, needs to depend the first trace on the last trace
+    recorded.
+    :return:
+    """
+    return len(TraceRegistry) - 1
 
 
 def dumptrace(tracefile=sys.stdout):
@@ -255,7 +268,7 @@ class TrackedList(TrackedContainer, list):
         for index, value in enumerate(list.__iter__(self)):
             # register all values.
             self[index] = value
-        self._head = self[0]
+        # self._head = self[0]
 
     def __iter__(self):
         return TrackedIterator(list.__iter__(self), self)
@@ -265,10 +278,6 @@ class TrackedList(TrackedContainer, list):
             raise NotImplementedError
         else:
             return super(TrackedList, self).__setitem__(key, value)
-
-    @property
-    def head(self):
-        return self._head
 
 
 class TrackedDict(TrackedContainer, dict, is_sparse=True):

@@ -6,6 +6,7 @@ from torch import sparse
 # For debugging
 from .networkx_stubs import TraceRegistry as tr
 from .networkx_stubs import TraceDepRegistry as tdr
+from .networkx_stubs import get_last_trace_id
 
 _n_bytes = 4
 
@@ -41,10 +42,14 @@ def csr_matmat_pass1(fn, *args, **kwargs):
     n_row, n_col, *tail = args
     Ap, Aj, Bp, Bj, Cp = [TList(x, is_host_init=True) for x in tail]
 
-    Ap_last_ptr, Ap_last_ptr_trace_id = Ap.head
+    Ap_last_ptr, Ap_last_ptr_trace_id = Ap.__getitem__(
+        0, deps=[get_last_trace_id()]
+    )
 
     for i in range(n_row):
-        Ap_curr_ptr, Ap_curr_ptr_trace_id = Ap[i+1]
+        Ap_curr_ptr, Ap_curr_ptr_trace_id = Ap.__getitem__(
+            i+1, deps=[get_last_trace_id()]
+        )
         js, js_trace_id = Aj.__getitem__(
             slice(Ap_last_ptr, Ap_curr_ptr),
             deps=[Ap_last_ptr_trace_id, Ap_curr_ptr_trace_id]
@@ -130,9 +135,13 @@ def csr_matvec(fn, *args, **kwargs):
     Ap, Aj, Ax, Xx, Yx = [TList(x, is_host_init=True) for x in tail]
 
     Yx_n_row, Yx_n_trace_id = Yx[0:n_row]
-    Ap_last_ptr, Ap_last_ptr_trace_id = Ap.head
+    Ap_last_ptr, Ap_last_ptr_trace_id = Ap.__getitem__(
+        0, deps=[get_last_trace_id()]
+    )
     for i, e in enumerate(Yx_n_row):
-        Ap_next_ptr, Ap_next_ptr_trace_id = Ap[i+1]
+        Ap_next_ptr, Ap_next_ptr_trace_id = Ap.__getitem__(
+            i+1, deps=[get_last_trace_id()]
+        )
         Ax.__getitem__(
             slice(Ap_last_ptr, Ap_next_ptr),
             deps=[Ap_last_ptr_trace_id, Ap_next_ptr_trace_id]
@@ -174,12 +183,19 @@ def csr_matvecs(fn, *args, **kwargs):
     Ap, Aj, Ax, Xx, Yx = [
         TList(x, is_host_init=True) for x in tail
     ]
-    Ap_last_ptr, Ap_last_ptr_trace_id = Ap.head
+    Ap_last_ptr, Ap_last_ptr_trace_id = Ap.__getitem__(
+        0, deps=[get_last_trace_id()]
+    )
 
     for i in range(n_row):
         y_ptr = n_vecs * i
-        _, Yx_trace_id = Yx[y_ptr:y_ptr+n_vecs]
-        Ap_new_ptr, Ap_new_ptr_trace_id = Ap[i+1]
+        _, Yx_trace_id = Yx.__getitem__(
+            slice(y_ptr, y_ptr+n_vecs),
+            deps=[get_last_trace_id()]
+        )
+        Ap_new_ptr, Ap_new_ptr_trace_id = Ap.__getitem__(
+            i+1, deps=[get_last_trace_id()]
+        )
 
         # Aj_jj_sublist = [Ap_last_ptr:Ap_new_ptr]
         # Ax_jj_sublist = Ax[Ap_last_ptr:Ap_new_ptr]
