@@ -6,6 +6,42 @@ from .networkx_stubs import TraceDepRegistry as tdr
 from .networkx_stubs import TraceRegistry as tr
 
 
+class TArrayTraceElement(typing.NamedTuple, int, float, np.ndarray):
+    value: object
+    trace_id: int
+
+    def __mul__(self, other):
+        return super(TArrayTraceElement, self).__mul__(self.value, other)
+
+    def __rmul__(self, other):
+        # return super(TArrayTraceElement, self).__rmul__(self.value, other)
+        return TArrayTraceElement(
+            value=other*self.value,
+            trace_id=self.trace_id
+        )
+
+    def __imul__(self, other):
+        return super(TArrayTraceElement, self).__imul__(self.value, other)
+
+    def __add__(self, other):
+        return super(TArrayTraceElement, self).__add__(self.value, other)
+
+    def __radd__(self, other):
+        return super(TArrayTraceElement, self).__radd__(self.value, other)
+
+    def __iadd__(self, other):
+        return super(TArrayTraceElement, self).__iadd__(self.value, other)
+
+    def __truediv__(self, other):
+        return super(TArrayTraceElement, self).__truediv__(self.value, other)
+
+    def __itruediv__(self, other):
+        return super(TArrayTraceElement, self).__itruediv__(self.value, other)
+
+    def __rtruediv__(self, other):
+        return super(TArrayTraceElement, self).__rtruediv__(self.value, other)
+
+
 class NpSet(set):
     """
     Numpy ndarray is not hashable. However a tuple of a flattened numpy
@@ -40,7 +76,6 @@ class TArray(np.ndarray):
     TODO: there might be a better way to call subroutines defined in the
     super class. Should be a way to just decorate all of these.
     """
-
     def _init_book_keeping(self) -> None:
         """
         This function initializes the memory allocation since TArray doesn't
@@ -49,10 +84,10 @@ class TArray(np.ndarray):
         self._tdict is a dictionary to store WA_ dependencies.
         :return:
         """
-        if not self._tlist:
-            self._tlist = TList([0] * self.size)
-        if not self._tdict:
-            self._tdict = {}
+        if '_tlist' not in vars(self):
+            self._tlist = TList([0] * self.size, is_host_init=True)
+        # if not self._tdict:
+        #     self._tdict = {}
 
     def _load_tlist(self) -> None:
         """
@@ -110,26 +145,60 @@ class TArray(np.ndarray):
         :return:
         """
         # TODO: replace the first line with a decorator function...
-        self._init_book_keeping()
-        key = args[0]
-        value = args[1]
-        dep_trace_id = self._tdict[key] if key in self._tdict else \
-           get_last_trace_id()
-        _, trace_id = self._tlist.__setitem__(key, value, deps=[dep_trace_id])
-        self._tdict[key] = trace_id
-        super().__setitem__(key, value)
+        print("in tarray setitem, ", *args)
+        super().__setitem__(*args, **kwargs)
 
     def __getitem__(self, *args, **kwargs):
-        self._init_book_keeping()
-        key = args[0]
-        dep_trace_id = self._tdict[key] if key in self._dict else \
-            get_last_trace_id()
-        item, item_trace_id = self._tlist.__getitem__(
-            key, deps=[dep_trace_id]
-        )
-        self._tdict[item] = item_trace_id
-        return super().__getitem__(*args, **kwargs)
+        # Seems that when calling the view function, the *args are in fact
+        # tuples. We only want to init getitem and setitem when the *args
+        # are either int or slices.
+        v = args[0]
+        if not isinstance(v, tuple):
+            self._init_book_keeping()
+            if isinstance(v, (int, np.int, np.int64, slice)):
+                print("getting single element, element = {}".format(v))
+                _, trace_id = self._tlist.__getitem__(
+                    v, deps=[get_last_trace_id()]
+                )
+                result = TArrayTraceElement(
+                    super(TArray, self).__getitem__(v),
+                    trace_id=trace_id
+                )
+            else:
+                print("Wrong format {}...".format(v))
+                result = super(TArray, self).__getitem__(*args, **kwargs)
+        elif isinstance(v, tuple):
+            if isinstance(v, TArrayTraceElement):
+                self._init_book_keeping()
+                print("getting a TATElement from TArray, value = {}".format(v))
+                _, trace_id = self._tlist.__getitem__(
+                    v.value, deps=[v.trace_id]
+                )
+                result = TArrayTraceElement(
+                    super(TArray, self).__getitem__(v.value),
+                    trace_id=trace_id
+                )
+            else:
+                print(
+                    "initing in the view function..., value = {}".format(v)
+                )
+                result = super(TArray, self).__getitem__(*args, **kwargs)
+        else:
+            print("Wrong format {}...".format(v))
+            result = super(TArray, self).__getitem__(*args, **kwargs)
 
+        # key = args[0]
+        # if isinstance(key, tuple):
+        #     self._init_book_keeping()
+        #     dep_trace_id = self._tdict[key] if key in self._tdict else \
+        #         get_last_trace_id()
+        #     item, item_trace_id = self._tlist.__getitem__(
+        #         key, deps=[dep_trace_id]
+        #     )
+        #     self._tdict[item] = item_trace_id
+
+        return result
+        
     def dot(self, *args, **kwargs):
         print("__dot__")
         self._blas_1_stub(*args)
@@ -183,5 +252,4 @@ class TArray(np.ndarray):
 def array(fn, *args, **kwargs):
     result = fn(*args, **kwargs)
     return result.view(TArray)
-
 

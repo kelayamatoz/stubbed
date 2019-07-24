@@ -40,7 +40,7 @@ class RegistryList(list):
             out_edges: typing.List[int] = None
     ) -> typing.Optional[int]:
         curr_id = len(TraceRegistry)
-        deps = deps if list(filter(lambda x: x >= 0, deps)) else []
+        deps = list(filter(lambda x: x >= 0, deps)) if deps else []
         out_edges = out_edges if out_edges else []
         TraceDepRegistry.append(TraceDepElement(deps, out_edges))
         for dep_id in deps:
