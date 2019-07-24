@@ -41,50 +41,94 @@ class TArray(np.ndarray):
     super class. Should be a way to just decorate all of these.
     """
 
+    def _init_book_keeping(self) -> None:
+        """
+        This function initializes the memory allocation since TArray doesn't
+        initialize itself via __init__.
+        self._tlist stores the tlist structure.
+        self._tdict is a dictionary to store WA_ dependencies.
+        :return:
+        """
+        if not self._tlist:
+            self._tlist = TList([0] * self.size)
+        if not self._tdict:
+            self._tdict = {}
+
+    def _load_tlist(self) -> None:
+        """
+        Simulate a load of all the elements stored in the current TArray.
+        :return:
+        """
+        _ = self._tlist.__getitem__(slice(None, None, None),
+                                    deps=[get_last_trace_id()])
+
     def _blas_3_stub(self, *args):
         global ProfiledArraySet
         other = args[0]
-        if isinstance(other, (TArray, np.ndarray)):
-            for k in [self, other]:
-                if k not in ProfiledArraySet:
-                    tmp = TList(
-                        [0] * k.size, is_host_init=True
-                    )
-                    _ = tmp.__getitem__(
-                        slice(None, None, None),
-                        deps=[get_last_trace_id()]
-                    )
+        self._init_book_keeping()
+
+        if isinstance(other, (TArray, np.ndarray)) and \
+                other not in ProfiledArraySet:
+            tmp = TList(
+                [0] * other.size, is_host_init=True
+            )
+            _ = tmp.__getitem__(
+                slice(None, None, None),
+                deps=[get_last_trace_id()]
+            )
 
             _profiled_check([self.T, other.T])
 
     def _blas_1_stub(self, *args):
         global ProfiledArraySet
+        self._init_book_keeping()
         if args:
             other = args[0]
-            if isinstance(other, (TArray, np.ndarray)):
-                for k in [self, other]:
-                    if k not in ProfiledArraySet:
-                        tmp = TList(
-                            [0] * k.size, is_host_init=True
-                        )
-                        _ = tmp.__getitem__(
-                            slice(None, None, None),
-                            deps=[get_last_trace_id()]
-                        )
-
-                _profiled_check([self.T, other.T])
-        else:
-           # a postfix function without args.
-            if self in ProfiledArraySet:
+            if isinstance(other, (TArray, np.ndarray)) and \
+                    other not in ProfiledArraySet:
                 tmp = TList(
-                    [0] * self.size, is_host_init=True
+                    [0] * other.size, is_host_init=True
                 )
                 _ = tmp.__getitem__(
                     slice(None, None, None),
                     deps=[get_last_trace_id()]
                 )
 
-                _profiled_check([self.T])
+                _profiled_check([self.T, other.T])
+
+    def __setitem__(self, *args, **kwargs):
+        """
+        This function is to capture dependencies. For a WA_, it would take
+        the form of:
+        A = foo.view(TArray)
+        A[idx, idx_trace_id_0] = c, c_trace_id # Write
+        _, _ = A[idx, idx_trace_id_0] # Read
+        or
+        A[idx, idx_trace_id_0] = _, _ # Write
+        :param args:
+        :param kwargs:
+        :return:
+        """
+        # TODO: replace the first line with a decorator function...
+        self._init_book_keeping()
+        key = args[0]
+        value = args[1]
+        dep_trace_id = self._tdict[key] if key in self._tdict else \
+           get_last_trace_id()
+        _, trace_id = self._tlist.__setitem__(key, value, deps=[dep_trace_id])
+        self._tdict[key] = trace_id
+        super().__setitem__(key, value)
+
+    def __getitem__(self, *args, **kwargs):
+        self._init_book_keeping()
+        key = args[0]
+        dep_trace_id = self._tdict[key] if key in self._dict else \
+            get_last_trace_id()
+        item, item_trace_id = self._tlist.__getitem__(
+            key, deps=[dep_trace_id]
+        )
+        self._tdict[item] = item_trace_id
+        return super().__getitem__(*args, **kwargs)
 
     def dot(self, *args, **kwargs):
         print("__dot__")

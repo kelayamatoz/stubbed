@@ -147,7 +147,7 @@ class TrackedContainer:
 
         self.key_to_loc_map = {}
 
-    def __setitem__(self, key, value):
+    def __setitem__(self, key, value, deps: typing.List = None):
         if isinstance(value, TrackedContainer):
             value.parent = self
             value.key = key
@@ -160,7 +160,8 @@ class TrackedContainer:
         # in the DRAM and the accelerator can just read from it.
         if not self._is_host_init:
             TraceRegistry.append(
-                lambda: self.getloc(key)._replace(type=TraceElement.WRITE)
+                lambda: self.getloc(key)._replace(type=TraceElement.WRITE),
+                deps=deps
             )
 
         super().__setitem__(key, value)
@@ -273,11 +274,11 @@ class TrackedList(TrackedContainer, list):
     def __iter__(self):
         return TrackedIterator(list.__iter__(self), self)
 
-    def __setitem__(self, key, value):
+    def __setitem__(self, key, value, deps: typing.List[int] = None):
         if isinstance(key, slice):
             raise NotImplementedError
         else:
-            return super(TrackedList, self).__setitem__(key, value)
+            return super(TrackedList, self).__setitem__(key, value, deps)
 
 
 class TrackedDict(TrackedContainer, dict, is_sparse=True):
