@@ -1,3 +1,5 @@
+from typing import Iterable, Tuple, Any
+
 import numpy as np
 import typing
 from .networkx_stubs import TrackedList as TList
@@ -6,40 +8,99 @@ from .networkx_stubs import TraceDepRegistry as tdr
 from .networkx_stubs import TraceRegistry as tr
 
 
-class TArrayTraceElement(typing.NamedTuple, int, float, np.ndarray):
-    value: object
-    trace_id: int
+class TArrayTraceElement:
+    """
+    A TArray element for book keeping.
+    The trace_id_list contains all the trace ids this element depends on.
+    TODO: need to find a way to dispatch these functions in one line. One
+    proposal is that I could use the inspect library to look at the function
+    vars, and then annotate them with my own subroutine.
+    """
 
+    def _merge_trace_id_lists(self, b):
+        default_trace_list = self.trace_id_list
+        if isinstance(b, TArrayTraceElement):
+            default_trace_list += b.trace_id_list
+        return default_trace_list
+
+    def _merge_value(self, b, fn: typing.Callable):
+        default_value = self.value
+        if isinstance(b, TArrayTraceElement):
+            default_value = fn(self.value, b)
+        return default_value
+
+    def __init__(self, value, trace_id_list: typing.List) -> None:
+        self.value = value
+        self.trace_id_list = trace_id_list
+
+    def __iter__(self):
+        return self.value.__iter__()
+        
     def __mul__(self, other):
-        return super(TArrayTraceElement, self).__mul__(self.value, other)
-
-    def __rmul__(self, other):
-        # return super(TArrayTraceElement, self).__rmul__(self.value, other)
         return TArrayTraceElement(
-            value=other*self.value,
-            trace_id=self.trace_id
+            value=self.value * other.value if isinstance(
+                other, TArrayTraceElement
+            ) else self.value * other,
+            trace_id_list=self._merge_trace_id_lists(other)
         )
 
+    def __rmul__(self, other):
+        return self.__mul__(other)
+
     def __imul__(self, other):
-        return super(TArrayTraceElement, self).__imul__(self.value, other)
+        return self.__mul__(other)
 
     def __add__(self, other):
-        return super(TArrayTraceElement, self).__add__(self.value, other)
+        return TArrayTraceElement(
+            value=self.value + other.value if isinstance(
+                other, TArrayTraceElement
+            ) else self.value + other,
+            trace_id_list=self._merge_trace_id_lists(other)
+        )
 
     def __radd__(self, other):
-        return super(TArrayTraceElement, self).__radd__(self.value, other)
+        return self.__add__(other)
 
     def __iadd__(self, other):
-        return super(TArrayTraceElement, self).__iadd__(self.value, other)
+        return self.__add__(other)
 
     def __truediv__(self, other):
-        return super(TArrayTraceElement, self).__truediv__(self.value, other)
+        return TArrayTraceElement(
+            value=self.value / other.value if isinstance(
+                other, TArrayTraceElement
+            ) else self.value / other,
+            trace_id_list=self._merge_trace_id_lists(other)
+        )
 
     def __itruediv__(self, other):
-        return super(TArrayTraceElement, self).__itruediv__(self.value, other)
+        return self.__truediv__(other)
 
     def __rtruediv__(self, other):
-        return super(TArrayTraceElement, self).__rtruediv__(self.value, other)
+        return TArrayTraceElement(
+            value=other.value / self.value if isinstance(
+                other, TArrayTraceElement
+            ) else other / self.value,
+            trace_id_list=self._merge_trace_id_lists(other)
+        )
+
+    def __sub__(self, other):
+        return TArrayTraceElement(
+            value=self.value - other.value if isinstance(
+                other, TArrayTraceElement
+            ) else self.value - other,
+            trace_id_list=self._merge_trace_id_lists(other)
+        )
+
+    def __isub__(self, other):
+        return self.__sub__(other)
+
+    def __rsub__(self, other):
+        return TArrayTraceElement(
+            value=other.value - self.value if isinstance(
+                other, TArrayTraceElement
+            ) else other - self.value,
+            trace_id_list=self._merge_trace_id_lists(other)
+        )
 
 
 class NpSet(set):
@@ -82,10 +143,12 @@ class TArray(np.ndarray):
         initialize itself via __init__.
         self._tlist stores the tlist structure.
         self._tdict is a dictionary to store WA_ dependencies.
+        TODO: remove the is_host_init. Do it at init time for TList.
         :return:
         """
         if '_tlist' not in vars(self):
             self._tlist = TList([0] * self.size, is_host_init=True)
+            self._tlist._is_host_init = False
         # if not self._tdict:
         #     self._tdict = {}
 
@@ -131,6 +194,13 @@ class TArray(np.ndarray):
 
                 _profiled_check([self.T, other.T])
 
+    @staticmethod
+    def _extract_val_trace_id_list(a):
+        if isinstance(a, TArrayTraceElement):
+            return a.value, a.trace_id_list
+        else:
+            return a, []
+
     def __setitem__(self, *args, **kwargs):
         """
         This function is to capture dependencies. For a WA_, it would take
@@ -144,41 +214,78 @@ class TArray(np.ndarray):
         :param kwargs:
         :return:
         """
-        # TODO: replace the first line with a decorator function...
+
         print("in tarray setitem, ", *args)
-        super().__setitem__(*args, **kwargs)
+        self._init_book_keeping()
+        k, v = args
+
+        # TODO: replace the first line with a decorator function...
+        key, key_trace_list = self._extract_val_trace_id_list(k)
+        val, val_trace_list = self._extract_val_trace_id_list(v)
+
+        # TODO: for now we assume that writes don't generate dependency.
+        # This is definitely wrong but seems to be good enough for many of
+        # our apps.
+        # TODO: in order to get the write through, I'm flipping the
+        # host_init attribute of self. Not a neat way to do and I will need
+        # to fix it in the future release. The current patch adds a barrier
+        # around writes.
+        self._tlist.__setitem__(
+            key, val, deps=key_trace_list + val_trace_list
+        )
+        super().__setitem__(key, val)
 
     def __getitem__(self, *args, **kwargs):
         # Seems that when calling the view function, the *args are in fact
         # tuples. We only want to init getitem and setitem when the *args
         # are either int or slices.
+        # TODO: the instances checks are here to guard against weird
+        # accesses thrown by the view function. Right now I'm patching it
+        # with these guards. Later we need to understand how these view
+        # functions work... The debugger also cannot catch these issues either.
         v = args[0]
         if not isinstance(v, tuple):
             self._init_book_keeping()
-            if isinstance(v, (int, np.int, np.int64, slice)):
+            if isinstance(
+                    v, (int, np.int, np.int64)
+            ) and v >= 0:
                 print("getting single element, element = {}".format(v))
                 _, trace_id = self._tlist.__getitem__(
-                    v, deps=[get_last_trace_id()]
+                    v, deps=[]
                 )
                 result = TArrayTraceElement(
                     super(TArray, self).__getitem__(v),
-                    trace_id=trace_id
+                    trace_id_list=[trace_id]
+                )
+            elif isinstance(v, slice):
+                print("getting slice, slice = {}".format(v))
+                slice_start_val, slice_start_trace_id_list = \
+                    self._extract_val_trace_id_list(v.start)
+                slice_stop_val, slice_stop_trace_id_list = \
+                    self._extract_val_trace_id_list(v.stop)
+                v = slice(slice_start_val, slice_stop_val)
+                _, trace_id = self._tlist.__getitem__(
+                    v,
+                    deps=slice_start_trace_id_list + slice_stop_trace_id_list
+                )
+                result = TArrayTraceElement(
+                    super(TArray, self).__getitem__(v),
+                    trace_id_list=[trace_id]
+                )
+
+            elif isinstance(v, TArrayTraceElement):
+                print("getting a TATElement from TArray, value = {}".format(v))
+                _, trace_id = self._tlist.__getitem__(
+                    v.value, deps=v.trace_id_list
+                )
+                result = TArrayTraceElement(
+                    super(TArray, self).__getitem__(v.value),
+                    trace_id_list=[trace_id]
                 )
             else:
                 print("Wrong format {}...".format(v))
                 result = super(TArray, self).__getitem__(*args, **kwargs)
         elif isinstance(v, tuple):
-            if isinstance(v, TArrayTraceElement):
-                self._init_book_keeping()
-                print("getting a TATElement from TArray, value = {}".format(v))
-                _, trace_id = self._tlist.__getitem__(
-                    v.value, deps=[v.trace_id]
-                )
-                result = TArrayTraceElement(
-                    super(TArray, self).__getitem__(v.value),
-                    trace_id=trace_id
-                )
-            else:
                 print(
                     "initing in the view function..., value = {}".format(v)
                 )
@@ -186,16 +293,6 @@ class TArray(np.ndarray):
         else:
             print("Wrong format {}...".format(v))
             result = super(TArray, self).__getitem__(*args, **kwargs)
-
-        # key = args[0]
-        # if isinstance(key, tuple):
-        #     self._init_book_keeping()
-        #     dep_trace_id = self._tdict[key] if key in self._tdict else \
-        #         get_last_trace_id()
-        #     item, item_trace_id = self._tlist.__getitem__(
-        #         key, deps=[dep_trace_id]
-        #     )
-        #     self._tdict[item] = item_trace_id
 
         return result
         
