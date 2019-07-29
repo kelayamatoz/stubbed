@@ -1,5 +1,3 @@
-from typing import Iterable, Tuple, Any
-
 import numpy as np
 import typing
 from .networkx_stubs import TrackedList as TList
@@ -34,6 +32,11 @@ class TArrayTraceElement:
         self.trace_id_list = trace_id_list
 
     def __iter__(self):
+        """
+        If we are iterating on an TArrayTraceElement, we can bulk-load
+        the actual array.
+        :return:
+        """
         return self.value.__iter__()
         
     def __mul__(self, other):
@@ -136,29 +139,20 @@ class TArray(np.ndarray):
 
     TODO: there might be a better way to call subroutines defined in the
     super class. Should be a way to just decorate all of these.
+
+    TODO: we may need to also subclass TList. For now I'm doing the
+    bookkeeping within the _init_book_keeping function...
     """
     def _init_book_keeping(self) -> None:
         """
-        This function initializes the memory allocation since TArray doesn't
-        initialize itself via __init__.
-        self._tlist stores the tlist structure.
-        self._tdict is a dictionary to store WA_ dependencies.
         TODO: remove the is_host_init. Do it at init time for TList.
         :return:
         """
         if '_tlist' not in vars(self):
             self._tlist = TList([0] * self.size, is_host_init=True)
             self._tlist._is_host_init = False
-        # if not self._tdict:
-        #     self._tdict = {}
-
-    def _load_tlist(self) -> None:
-        """
-        Simulate a load of all the elements stored in the current TArray.
-        :return:
-        """
-        _ = self._tlist.__getitem__(slice(None, None, None),
-                                    deps=[get_last_trace_id()])
+            self._is_iter = False
+            self._iter_id = -1
 
     def _blas_3_stub(self, *args):
         global ProfiledArraySet
@@ -200,6 +194,16 @@ class TArray(np.ndarray):
             return a.value, a.trace_id_list
         else:
             return a, []
+
+    def __iter__(self, *args, **kwargs):
+        self._init_book_keeping()
+        if not self._is_iter:
+            self._is_iter = True
+            _, self._iter_id = self._tlist.__getitem__(
+                slice(None, None, None),
+                deps=[get_last_trace_id()]
+            )
+        return super().__iter__(*args, **kwargs)
 
     def __setitem__(self, *args, **kwargs):
         """
@@ -250,9 +254,10 @@ class TArray(np.ndarray):
                     v, (int, np.int, np.int64)
             ) and v >= 0:
                 print("getting single element, element = {}".format(v))
-                _, trace_id = self._tlist.__getitem__(
-                    v, deps=[]
-                )
+                if self._is_iter:
+                    trace_id = self._iter_id
+                else:
+                    _, trace_id = self._tlist.__getitem__(v, deps=[])
                 result = TArrayTraceElement(
                     super(TArray, self).__getitem__(v),
                     trace_id_list=[trace_id]
@@ -275,9 +280,12 @@ class TArray(np.ndarray):
 
             elif isinstance(v, TArrayTraceElement):
                 print("getting a TATElement from TArray, value = {}".format(v))
-                _, trace_id = self._tlist.__getitem__(
-                    v.value, deps=v.trace_id_list
-                )
+                if self._is_iter:
+                    trace_id = self._iter_id
+                else:
+                    _, trace_id = self._tlist.__getitem__(
+                        v.value, deps=v.trace_id_list
+                    )
                 result = TArrayTraceElement(
                     super(TArray, self).__getitem__(v.value),
                     trace_id_list=[trace_id]
