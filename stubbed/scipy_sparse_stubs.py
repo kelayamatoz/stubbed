@@ -6,7 +6,7 @@ from torch import sparse
 # For debugging
 from .networkx_stubs import TraceRegistry as tr
 from .networkx_stubs import TraceDepRegistry as tdr
-from .networkx_stubs import get_last_trace_id
+from .networkx_stubs import get_last_trace_id, add_to_ops_accum
 
 _n_bytes = 4
 
@@ -38,8 +38,16 @@ def csr_matmat_pass1(fn, *args, **kwargs):
     """
 
     print("in csr_matmat_pass1")
-
     n_row, n_col, *tail = args
+    _, Aj_raw, Bp_raw, Bj_raw, _ = tail
+    n = len(Bp_raw)
+    P = float(len(Aj_raw)) / float(n_row * n)
+    Q = float(len(Bj_raw)) / float(n_col * n)
+    # We are using the assumption that the probability of nnzs are independent.
+    add_to_ops_accum(
+        n_row * n_col * n * P * Q * 2
+    )
+
     Ap, Aj, Bp, Bj, Cp = [TList(x, is_host_init=True) for x in tail]
 
     Ap_last_ptr, Ap_last_ptr_trace_id = Ap.__getitem__(
@@ -131,7 +139,12 @@ def csr_matvec(fn, *args, **kwargs):
         Yx[i] = sum
     """
     print("in csr_matvec")
+
     n_row, n_col, *tail = args
+    _, _, Ax_raw, _, _ = tail
+    nnz = len(Ax_raw)
+    add_to_ops_accum(nnz * 2)
+
     Ap, Aj, Ax, Xx, Yx = [TList(x, is_host_init=True) for x in tail]
 
     Yx_n_row, Yx_n_trace_id = Yx[0:n_row]
@@ -167,12 +180,12 @@ def csr_matvecs(fn, *args, **kwargs):
     """
     Pseudo code
     for i in range(n_row):
-        Y_ptr = Yx + n_vecs * i
-        for jj in range(Ap[i], Ap[i+1):
+        Y_ptr = Yx + n_vecs * i             # 2 * n_row ops
+        for jj in range(Ap[i], Ap[i+1):     # nnz
             j = Aj[jj]
             a = Ax[jj]
-            x = Xx + n_vecs * j
-            axpy(n_vecs, a, x, y)
+            x = Xx + n_vecs * j             # 2 * nnz ops
+            axpy(n_vecs, a, x, y)           # n_vecs * 2 * nnz ops
     :param fn:
     :param args:
     :param kwargs:
@@ -180,6 +193,11 @@ def csr_matvecs(fn, *args, **kwargs):
     """
     print("in csr_matvecs")
     n_row, _, n_vecs, *tail = args
+    Ap_raw = tail[0]
+    nnz = len(Ap_raw)
+    add_to_ops_accum(
+        n_row * 2 + nnz * (2 + n_vecs * 2)
+    )
     Ap, Aj, Ax, Xx, Yx = [
         TList(x, is_host_init=True) for x in tail
     ]

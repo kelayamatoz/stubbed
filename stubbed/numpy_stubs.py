@@ -1,9 +1,13 @@
 import numpy as np
 import typing
+from math import ceil, floor
 from .networkx_stubs import TrackedList as TList
-from .networkx_stubs import get_last_trace_id
+from .networkx_stubs import get_last_trace_id, add_to_ops_accum
 from .networkx_stubs import TraceDepRegistry as tdr
 from .networkx_stubs import TraceRegistry as tr
+
+# Tile size is 4MB, 1M ints
+TILE_SIZE = int(2 * 1024 * 1024 / 4)
 
 
 class TArrayTraceElement:
@@ -14,6 +18,13 @@ class TArrayTraceElement:
     proposal is that I could use the inspect library to look at the function
     vars, and then annotate them with my own subroutine.
     """
+
+    def _update_nops_accum(self):
+        add_to_ops_accum(
+            len(self.value) if isinstance(
+                self.value.size, (np.ndarray, TArray)
+            ) else 1
+        )
 
     def _merge_trace_id_lists(self, b):
         default_trace_list = self.trace_id_list
@@ -38,8 +49,24 @@ class TArrayTraceElement:
         :return:
         """
         return self.value.__iter__()
-        
+
+    def __le__(self, other):
+        return self.value <= other
+
+    def __eq__(self, other):
+        return self.value == other
+
+    def __gt__(self, other):
+        return self.value > other
+
+    def __lt__(self, other):
+        return self.value < other
+
+    def __ge__(self, other):
+        return self.value >= other
+
     def __mul__(self, other):
+        self._update_nops_accum()
         return TArrayTraceElement(
             value=self.value * other.value if isinstance(
                 other, TArrayTraceElement
@@ -54,6 +81,7 @@ class TArrayTraceElement:
         return self.__mul__(other)
 
     def __add__(self, other):
+        self._update_nops_accum()
         return TArrayTraceElement(
             value=self.value + other.value if isinstance(
                 other, TArrayTraceElement
@@ -68,6 +96,7 @@ class TArrayTraceElement:
         return self.__add__(other)
 
     def __truediv__(self, other):
+        self._update_nops_accum()
         return TArrayTraceElement(
             value=self.value / other.value if isinstance(
                 other, TArrayTraceElement
@@ -79,6 +108,7 @@ class TArrayTraceElement:
         return self.__truediv__(other)
 
     def __rtruediv__(self, other):
+        self._update_nops_accum()
         return TArrayTraceElement(
             value=other.value / self.value if isinstance(
                 other, TArrayTraceElement
@@ -87,6 +117,7 @@ class TArrayTraceElement:
         )
 
     def __sub__(self, other):
+        self._update_nops_accum()
         return TArrayTraceElement(
             value=self.value - other.value if isinstance(
                 other, TArrayTraceElement
@@ -98,11 +129,26 @@ class TArrayTraceElement:
         return self.__sub__(other)
 
     def __rsub__(self, other):
+        self._update_nops_accum()
         return TArrayTraceElement(
             value=other.value - self.value if isinstance(
                 other, TArrayTraceElement
             ) else other - self.value,
             trace_id_list=self._merge_trace_id_lists(other)
+        )
+
+    def sum(self):
+        self._update_nops_accum()
+        return TArrayTraceElement(
+            value=self.value.sum(),
+            trace_id_list=self.trace_id_list
+        )
+
+    def dot(self, other):
+        self._update_nops_accum()
+        return TArrayTraceElement(
+            value=self.value.dot(other),
+            trace_id_list=self.trace_id_list
         )
 
 
@@ -113,7 +159,11 @@ class NpSet(set):
     This function wraps a numpy ndarray with a tuple wrapper.
     """
 
-    def add(self, element: np.ndarray) -> None:
+    def add(self, element) -> None:
+        if isinstance(element, TArrayTraceElement):
+            element = element.value
+        elif isinstance(element, TArray):
+            element = TArray.view(np.ndarray)
         super().add(tuple(element.flatten()))
 
     def __contains__(self, item):
@@ -126,9 +176,14 @@ ProfiledArraySet: typing.Set = NpSet()
 
 
 def _profiled_check(items: typing.List):
-    for k in items:
-        if k not in ProfiledArraySet:
-            ProfiledArraySet.add(k)
+    """
+    Disable profiled check for now as this seems to incur unnecessary tests...
+    :param items:
+    :return:
+    """
+    # for k in items:
+    #     if k not in ProfiledArraySet:
+    #         ProfiledArraySet.add(k)
 
 
 class TArray(np.ndarray):
@@ -154,26 +209,128 @@ class TArray(np.ndarray):
             self._is_iter = False
             self._iter_id = -1
 
+    def _update_blas_3_ops(self, a, b):
+        if isinstance(
+            a, (TArray, np.ndarray)
+        ) and isinstance(
+            b, (TArray, np.ndarray)
+        ):
+            a_n_rows, a_n_cols = a.shape
+            _, b_n_cols = b.shape
+            add_to_ops_accum(
+                a_n_rows * a_n_cols * b_n_cols * 2
+            )
+
+    def _update_blas_1_map_ops(self, other):
+        if isinstance(other, (TArray, np.ndarray)):
+            add_to_ops_accum(len(other))
+
+    def _update_blas_1_map_reduce_ops(self, other):
+        if isinstance(other, (TArray, np.ndarray)):
+            add_to_ops_accum(len(other) * 2)
+
     def _blas_3_stub(self, *args):
         global ProfiledArraySet
         other = args[0]
         self._init_book_keeping()
+        self._update_blas_3_ops(self, other)
 
         if isinstance(other, (TArray, np.ndarray)) and \
                 other not in ProfiledArraySet:
-            tmp = TList(
-                [0] * other.size, is_host_init=True
-            )
-            _ = tmp.__getitem__(
-                slice(None, None, None),
-                deps=[get_last_trace_id()]
-            )
+            if other.size > TILE_SIZE or self.size > TILE_SIZE:
+                # We need to do tiling here for both reads and writes
+                def _get_row_col_steps(a_shape: typing.Tuple,
+                                       b_shape: typing.Tuple):
+                    """
+                    Once getting a shape, this function should return the
+                    number of steps required to step through both dimensions
+                    based on the given tile size.
+                    :param shape:
+                    :return: m_steps, k_steps, n_steps, tile_size on the
+                    reduce dim
+                    """
+                    m, _k = a_shape
+                    __k, n = b_shape
+                    if _k != __k:
+                        print("Warning: inner product dimensions don't match!")
+
+                    k = _k
+
+                    _step_size = ceil(TILE_SIZE / float(k))
+                    _m_steps = ceil(m / _step_size)
+                    _n_steps = ceil(n / _step_size)
+                    _k_steps = ceil(
+                        float(k) / TILE_SIZE
+                    ) if _step_size == 1 else 1
+                    _m_residual_step_size = m % _step_size
+                    return _m_steps, _k_steps, _n_steps, _step_size, \
+                        m % _step_size, n % _step_size
+
+                m_steps, k_steps, n_steps, step_size, \
+                m_residual_step_size, n_residual_step_size \
+                    = _get_row_col_steps(self.shape, other.shape)
+
+                # Each tiled multiplication is within a map scope; hence
+                # there's no dependency here.
+
+                par_dep = get_last_trace_id()
+                for i_m in range(m_steps):
+                    for i_n in range(n_steps):
+
+                        # Issue all the reads for doing this inner matmul
+                        for i_k in range(k_steps):
+                            # Load two read tiles of size TILE_SIZE
+                            def _get_read_trace_id():
+                                _tmp = TList(
+                                    [0] * TILE_SIZE, is_host_init=True
+                                )
+                                _, trace_id = _tmp.__getitem__(
+                                    slice(None, None, None),
+                                    deps=[par_dep]
+                                )
+
+                                return trace_id
+
+                            read_deps = [
+                                _get_read_trace_id() for i in range(2)
+                            ]
+
+                        # Issue tiled writes
+                        m_curr_step_size = step_size \
+                            if i_m < m_steps - 1 else m_residual_step_size
+                        n_curr_step_size = step_size \
+                            if i_n < n_steps - 1 else n_residual_step_size
+                        write_size = m_curr_step_size * n_curr_step_size
+                        write_steps = ceil(write_size / float(TILE_SIZE))
+
+                        for i_w in range(write_steps):
+                            _tmp = TList(
+                                [0] * TILE_SIZE,
+                                is_host_init=True
+                            )
+                            _tmp.__setitem__(
+                                slice(None, None, None),
+                                slice(None, None, None),
+                                deps=read_deps
+                            )
+
+            else:
+                tmp = TList(
+                    [0] * other.size, is_host_init=True
+                )
+                _ = tmp.__getitem__(
+                    slice(None, None, None),
+                    deps=[get_last_trace_id()]
+                )
 
             _profiled_check([self.T, other.T])
 
     def _blas_1_stub(self, *args):
         global ProfiledArraySet
         self._init_book_keeping()
+
+        add_to_ops_accum(self.size)
+
         if args:
             other = args[0]
             if isinstance(other, (TArray, np.ndarray)) and \
@@ -219,11 +376,9 @@ class TArray(np.ndarray):
         :return:
         """
 
-        print("in tarray setitem, ", *args)
         self._init_book_keeping()
         k, v = args
 
-        # TODO: replace the first line with a decorator function...
         key, key_trace_list = self._extract_val_trace_id_list(k)
         val, val_trace_list = self._extract_val_trace_id_list(v)
 
@@ -253,17 +408,18 @@ class TArray(np.ndarray):
             if isinstance(
                     v, (int, np.int, np.int64)
             ) and v >= 0:
-                print("getting single element, element = {}".format(v))
                 if self._is_iter:
+                    # print("getting element from iter, element = {}".format(v))
                     trace_id = self._iter_id
                 else:
+                    # print("getting single element, element = {}".format(v))
                     _, trace_id = self._tlist.__getitem__(v, deps=[])
                 result = TArrayTraceElement(
                     super(TArray, self).__getitem__(v),
                     trace_id_list=[trace_id]
                 )
             elif isinstance(v, slice):
-                print("getting slice, slice = {}".format(v))
+                # print("getting slice, slice = {}".format(v))
                 slice_start_val, slice_start_trace_id_list = \
                     self._extract_val_trace_id_list(v.start)
                 slice_stop_val, slice_stop_trace_id_list = \
@@ -279,7 +435,7 @@ class TArray(np.ndarray):
                 )
 
             elif isinstance(v, TArrayTraceElement):
-                print("getting a TATElement from TArray, value = {}".format(v))
+                # print("getting a TATElement from TArray, value = {}".format(v))
                 if self._is_iter:
                     trace_id = self._iter_id
                 else:
@@ -294,9 +450,9 @@ class TArray(np.ndarray):
                 print("Wrong format {}...".format(v))
                 result = super(TArray, self).__getitem__(*args, **kwargs)
         elif isinstance(v, tuple):
-                print(
-                    "initing in the view function..., value = {}".format(v)
-                )
+                # print(
+                    # "initing in the view function..., value = {}".format(v)
+                # )
                 result = super(TArray, self).__getitem__(*args, **kwargs)
         else:
             print("Wrong format {}...".format(v))
@@ -305,28 +461,33 @@ class TArray(np.ndarray):
         return result
         
     def dot(self, *args, **kwargs):
-        print("__dot__")
+        # print("__dot__")
         self._blas_1_stub(*args)
+        self._update_blas_1_map_ops(self) # Add one more here for reduction
         return super(TArray, self).dot(*args, **kwargs)
 
     def __add__(self, *args, **kwargs):
-        print("add")
+        # print("add")
         self._blas_1_stub(*args)
         return super(TArray, self).__add__(*args, **kwargs)
 
     def __iadd__(self, *args, **kwargs):
-        print("iadd")
+        # print("iadd")
         self._blas_1_stub(*args)
         return super(TArray, self).__iadd__(*args, **kwargs)
 
     def __radd__(self, *args, **kwargs):
-        print("radd")
+        # print("radd")
         self._blas_1_stub(*args)
         return super(TArray, self).__radd__(*args, **kwargs)
 
     def sum(self, *args, **kwargs):
-        print("sum")
-        self._blas_1_stub(*args)
+        # print("sum")
+        # stubbing is done already...
+        # self._blas_1_stub(*args)
+
+        # ops counting is not
+        self._update_blas_1_map_ops(self)
         return super(TArray, self).sum(*args, **kwargs)
 
     def __matmul__(self, *args, **kwargs):
@@ -334,22 +495,22 @@ class TArray(np.ndarray):
         return super(TArray, self).__matmul__(*args, **kwargs)
 
     def __rmatmul__(self, *args, **kwargs):
-        print("__rmatmul__")
+        # print("__rmatmul__")
         self._blas_1_stub(*args)
         return super(TArray, self).__rmatmul__(*args, **kwargs)
 
     def __mul__(self, *args, **kwargs):
-        print("__mul__")
+        # print("__mul__")
         self._blas_1_stub(*args)
         return super(TArray, self).__mul__(*args, **kwargs)
 
     def __rmul__(self, *args, **kwargs):
-        print("__rmul__")
+        # print("__rmul__")
         self._blas_1_stub(*args)
         return super(TArray, self).__rmul__(*args, **kwargs)
 
     def __imul__(self, *args, **kwargs):
-        print("__imul__")
+        # print("__imul__")
         self._blas_1_stub(*args)
         return super(TArray, self).__imul__(*args, **kwargs)
 

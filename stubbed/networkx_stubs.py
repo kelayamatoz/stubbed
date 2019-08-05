@@ -57,6 +57,16 @@ IteratorCounter = itertools.count()
 # TraceRegistry: typing.List[typing.Callable[[], TraceElement]] = []
 TraceRegistry = RegistryList()
 MemorySpaceRegistry: typing.List[typing.Callable[[], MemorySpace]] = []
+OpsAccum: int = 0
+
+
+def add_to_ops_accum(nops: int):
+    global OpsAccum
+    OpsAccum += nops
+
+def get_ops_accum():
+    global OpsAccum
+    return OpsAccum
 
 
 def get_last_trace_id():
@@ -72,10 +82,13 @@ def get_last_trace_id():
 
 
 def dumptrace(tracefile=sys.stdout):
+    global OpsAccum
+    print("Number of Ops: {}".format(int(OpsAccum)))
     print("Traces:", len(TraceRegistry))
     for trace_id, (trace, trace_dep) in enumerate(
             zip(TraceRegistry[:], TraceDepRegistry[:])):
         try:
+            # print(*trace(), file=tracefile, sep="\t")
             print(trace_id, file=tracefile, sep="\t", end="\t")
             print(*trace(), file=tracefile, sep="\t", end="\t")
             print(*trace_dep, file=tracefile, sep="\t")
@@ -147,6 +160,12 @@ class TrackedContainer:
 
         self.key_to_loc_map = {}
 
+    def _parse_slice(self, key: slice):
+        start = key.start if key.start else 0
+        stop = key.stop if key.stop else len(self)
+        length = stop - start
+        return start, stop, length
+
     def __setitem__(self, key, value, deps: typing.List = None):
         if isinstance(value, TrackedContainer):
             value.parent = self
@@ -156,17 +175,30 @@ class TrackedContainer:
         else:
             self.max_element_size_registry.append(self.feature_size)
 
+        self.max_len = max(self.max_len, len(self))
+
         # If is not a host init, we should assume that the data is prepared
         # in the DRAM and the accelerator can just read from it.
-        if not self._is_host_init:
-            TraceRegistry.append(
+        trace_id = get_last_trace_id()
+
+        if isinstance(value, slice):
+            start, _, length = self._parse_slice(value)
+            trace_id = TraceRegistry.append(
+                lambda: self.getloc(start)._replace(
+                    type=TraceElement.WRITE,
+                    size=self.feature_size * length
+                ),
+                deps=deps
+            )
+        elif not self._is_host_init:
+            trace_id = TraceRegistry.append(
                 lambda: self.getloc(key)._replace(type=TraceElement.WRITE),
                 deps=deps
             )
 
-        super().__setitem__(key, value)
+            super().__setitem__(key, value)
 
-        self.max_len = max(self.max_len, len(self))
+        return trace_id
 
     def __getitem__(
             self, key, deps: typing.List[int] = [],
@@ -176,9 +208,7 @@ class TrackedContainer:
 
         if isinstance(key, slice):
             # Issue a dense read for slices
-            start = key.start if key.start else 0
-            stop = key.stop if key.stop else len(self)
-            length = stop - start
+            start, _, length = self._parse_slice(key)
             trace_id = TraceRegistry.append(
                 lambda: self.getloc(start)._replace(
                     type=TraceElement.READ,
@@ -266,19 +296,17 @@ class TrackedContainer:
 class TrackedList(TrackedContainer, list):
     def __init__(self, *args, is_host_init=False, **kwargs):
         super().__init__(*args, is_host_init=is_host_init, **kwargs)
-        for index, value in enumerate(list.__iter__(self)):
-            # register all values.
-            self[index] = value
+        # Avoid writes as these could be expensive...
+        # for index, value in enumerate(list.__iter__(self)):
+        #     # register all values.
+        #     self[index] = value
         # self._head = self[0]
 
     def __iter__(self):
         return TrackedIterator(list.__iter__(self), self)
 
     def __setitem__(self, key, value, deps: typing.List[int] = None):
-        if isinstance(key, slice):
-            raise NotImplementedError
-        else:
-            return super(TrackedList, self).__setitem__(key, value, deps)
+        return super(TrackedList, self).__setitem__(key, value, deps)
 
 
 class TrackedDict(TrackedContainer, dict, is_sparse=True):
