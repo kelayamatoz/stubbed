@@ -88,10 +88,10 @@ def dumptrace(tracefile=sys.stdout):
     for trace_id, (trace, trace_dep) in enumerate(
             zip(TraceRegistry[:], TraceDepRegistry[:])):
         try:
-            # print(*trace(), file=tracefile, sep="\t")
-            print(trace_id, file=tracefile, sep="\t", end="\t")
-            print(*trace(), file=tracefile, sep="\t", end="\t")
-            print(*trace_dep, file=tracefile, sep="\t")
+            print(*trace(), file=tracefile, sep="\t")
+            # print(trace_id, file=tracefile, sep="\t", end="\t")
+            # print(*trace(), file=tracefile, sep="\t", end="\t")
+            # print(*trace_dep, file=tracefile, sep="\t")
 
         except TypeError:
             # Networkx has a bad habit of catching TypeErrors
